@@ -1,0 +1,95 @@
+use std::evm::DAY
+
+/// Unix day number. Allowances reset at 00:00 UTC.
+pub fn utc_day(now: Timestamp) -> u256 {
+    now.as_seconds() / DAY.as_seconds()
+}
+
+/// Remaining allowance for a persisted (spent, spent_day) pair.
+/// A smaller limit can leave the day's previous spend above the new limit.
+pub fn remaining_at(limit: Wei, spent: Wei, spent_day: u256, now: Timestamp) -> Wei {
+    let today = utc_day(now: now)
+    if today < spent_day {
+        return Wei::zero()
+    }
+    if today > spent_day {
+        return limit
+    }
+    if spent >= limit {
+        return Wei::zero()
+    }
+    limit - spent
+}
+
+/// Authorize a positive charge and return the updated total spent today.
+/// Callers persist that result with utc_day(now) only on success.
+pub fn charge_at(limit: Wei, spent: Wei, spent_day: u256, now: Timestamp, amount: Wei) -> Wei {
+    let available = remaining_at(limit: limit, spent: spent, spent_day: spent_day, now: now)
+    assert!(amount > Wei::zero(), "Zero charge")
+    assert!(amount <= available, "Allowance exceeded")
+    limit - available + amount
+}
+
+pub msg BudgetMsg {
+    #[selector = sol("setLimit(uint256)")]
+    SetLimit { limit: Wei },
+    #[selector = sol("revoke()")]
+    Revoke,
+    #[selector = sol("consume(uint256)")]
+    Consume { amount: Wei } -> Wei,
+    #[selector = sol("remaining()")]
+    Remaining -> Wei,
+}
+
+/// An allowance ledger for a single owner and agent. Consuming records the
+/// value authorized for the calling agent.
+pub contract WeiBudget uses (ctx: Ctx) {
+    owner: Address,
+    agent: Address,
+    mut daily_limit: Wei,
+    mut spent: Wei,
+    mut spent_day: u256,
+
+    init(delegate: Address)
+    uses (ctx, mut owner, mut agent)
+    {
+        assert!(delegate != Address::new(0), "Zero agent")
+        owner = ctx.caller()
+        agent = delegate
+    }
+
+    recv BudgetMsg {
+        SetLimit { limit } uses (ctx, owner, mut daily_limit) {
+            assert!(ctx.caller() == owner, "Owner required")
+            daily_limit = limit
+        }
+
+        Revoke uses (ctx, owner, mut daily_limit) {
+            assert!(ctx.caller() == owner, "Owner required")
+            daily_limit = Wei::zero()
+        }
+
+        Consume { amount } -> Wei uses (ctx, agent, daily_limit, mut spent, mut spent_day) {
+            assert!(ctx.caller() == agent, "Agent required")
+            let now = ctx.timestamp()
+            spent = charge_at(
+                limit: daily_limit,
+                spent: spent,
+                spent_day: spent_day,
+                now: now,
+                amount: amount,
+            )
+            spent_day = utc_day(now: now)
+            daily_limit - spent
+        }
+
+        Remaining -> Wei uses (ctx, daily_limit, spent, spent_day) {
+            remaining_at(
+                limit: daily_limit,
+                spent: spent,
+                spent_day: spent_day,
+                now: ctx.timestamp(),
+            )
+        }
+    }
+}
