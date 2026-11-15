@@ -1,0 +1,20 @@
+name: WeiBudget
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and exercise the deployed contract
+        run: ./demo
+      - name: Check formatting and run Fe tests
+        run: |
+          export PATH="$PWD/.tools:$PATH"
+          fe fmt --check
+          fe test
+          fe build

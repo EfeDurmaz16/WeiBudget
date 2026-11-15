@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Run the local demo, fetching verified tools into this checkout if needed."""
+
+import hashlib
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from urllib.request import urlopen
+
+
+ROOT = Path(__file__).resolve().parent
+CACHE = ROOT / ".tools"
+FE = "26.6.0"
+ANVIL = "1.7.1"
+
+# SHA-256 digests from the Fe and Foundry release asset manifests.
+DIGESTS = {
+    ("Darwin", "arm64"): (
+        "de045cf2ccd5a4052d92cde7745ff052747235b9c98e745a0995a8ad40a0c78e",
+        "eacdc67718fac857cad9e19c7f6729dd80de731d09df81856391d093cfcab547",
+    ),
+    ("Darwin", "amd64"): (
+        "d9330215915347c95e1fb8f6c0bf2f54e76faeb90db57176d4fe2a57c9f25267",
+        "c7fd1f5c9bf718d30b5cb6fc94eac605039de2aa50afc4c545a4dddc1e411acb",
+    ),
+    ("Linux", "arm64"): (
+        "011caa8a297763b3c1540048beb92bea047f0868eabe0ea1b4822e99d945fe26",
+        "c8fe8fa09ae3aba2c81b510c6f9da3a9d468029b9580e690b245b3f0aea687ae",
+    ),
+    ("Linux", "amd64"): (
+        "697081cb9265bd1be7a5d33e6bb0c8559ee5ff542abab9a046540fc151b4edaa",
+        "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b",
+    ),
+}
+
+
+def ensure_tool(name, version, url, digest):
+    path = shutil.which(name)
+    if path:
+        result = subprocess.run([path, "--version"], capture_output=True, text=True)
+        if result.returncode == 0 and re.search(
+            rf"^{name} (?:Version: )?{re.escape(version)}(?=[\s-]|$)", result.stdout
+        ):
+            return
+
+    print(f"Fetching {name} {version} into .tools/", flush=True)
+    CACHE.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=CACHE) as directory:
+        archive = Path(directory) / "download"
+        checksum = hashlib.sha256()
+        with urlopen(url, timeout=90) as source, archive.open("wb") as target:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                checksum.update(chunk)
+                target.write(chunk)
+        if checksum.hexdigest() != digest:
+            sys.exit(f"SHA-256 mismatch for {name} {version}")
+        binary = archive
+        if name == "anvil":
+            binary = Path(directory) / name
+            with tarfile.open(archive, "r:gz") as bundle:
+                member = next(m for m in bundle if m.isfile() and m.name in (name, "./" + name))
+                with bundle.extractfile(member) as source, binary.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+        binary.chmod(0o755)
+        binary.replace(CACHE / name)
+
+
+if __name__ == "__main__":
+    host = platform.system()
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
+    if (host, arch) not in DIGESTS:
+        sys.exit("Run the demo on macOS or Linux (x86-64 or ARM64).")
+    os.environ["PATH"] = str(CACHE) + os.pathsep + os.environ["PATH"]
+    fe_hash, anvil_hash = DIGESTS[host, arch]
+    github = "https://github.com"
+    fe_os = "mac" if host == "Darwin" else "linux"
+    ensure_tool("fe", FE, f"{github}/argotorg/fe/releases/download/v{FE}/fe_{fe_os}_{arch}", fe_hash)
+    asset = f"foundry_v{ANVIL}_{host.lower()}_{arch}.tar.gz"
+    ensure_tool("anvil", ANVIL, f"{github}/foundry-rs/foundry/releases/download/v{ANVIL}/{asset}", anvil_hash)
+    os.execv(sys.executable, [sys.executable, str(ROOT / "scripts" / "run-demo.py")])
