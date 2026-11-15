@@ -1,6 +1,6 @@
 # WeiBudget
 
-An owner gives one agent a daily allowance in wei and can revoke it in one call. If the owner restores the allowance later that day, the agent can use only what it had left. WeiBudget implements this rule as a small Fe library and an EVM contract.
+An owner gives one agent a daily ETH allowance. The [reference wallet](src/wallet.fe) charges the allowance and sends the payment in one EVM transaction. If the recipient rejects the payment, the agent keeps its unused allowance. If the owner revokes and restores the limit that day, any successful payments still count.
 
 ## Try it
 
@@ -10,17 +10,20 @@ From a checkout on macOS or Linux (ARM64 or x86-64), with Python 3.9 or newer:
 ./demo
 ```
 
-The launcher uses Fe 26.6.0 and Anvil 1.7.1. If a matching tool is missing, it downloads the official release, verifies its SHA-256 digest and installs it under `.tools/` in this checkout. The first run needs network access for missing tools. The demo starts its own disposable local chain with two temporary accounts. It reads each result from the deployed contract and checks the receipt of each transaction.
+The launcher uses Fe 26.6.0 and Anvil 1.7.1. If a matching tool is missing, it downloads the official release, verifies its SHA-256 digest and installs it under `.tools/` in this checkout. The first run needs network access for missing tools. The demo starts a disposable local chain. It checks transaction receipts, ETH balances and the remaining allowance through the public ABI.
 
-| Action | Remaining |
-| --- | ---: |
-| Owner grants 10 wei per UTC day | 10 |
-| Agent consumes 6, then 4 | 4, then 0 |
-| Agent tries one more wei | 0, transaction reverts |
-| First block of the next UTC day | 10 |
-| Agent consumes 3 | 7 |
-| Owner revokes and the agent tries to consume 1 | 0, transaction reverts |
-| Owner restores the 10 wei limit that day | 7 |
+Each row below shows the on-chain state after the action, in wei. The wallet starts with 20 wei and a daily limit of 10.
+
+| Action | Wallet balance | Recipient balance | Rejecting contract balance | Available allowance |
+| --- | ---: | ---: | ---: | ---: |
+| Grant 10 | 20 | 0 | 0 | 10 |
+| Pay the recipient 6 | 14 | 6 | 0 | 4 |
+| Try paying the rejecting contract 3 | 14 | 6 | 0 | 4 |
+| Revoke the allowance | 14 | 6 | 0 | 0 |
+| Try paying the original recipient 1 | 14 | 6 | 0 | 0 |
+| Restore the 10 wei limit on the same day | 14 | 6 | 0 | 4 |
+
+The demo then uses the remaining 4 wei, checks that the next wei is denied, and pays again after the next UTC midnight. The recipient never submits a transaction, so gas fees do not affect its balance.
 
 ## How it works
 
@@ -35,9 +38,9 @@ The contract stores the owner, agent, daily limit, last spending day and amount 
 | `consume(uint256)` | Agent | Records a positive charge or reverts. Returns the remaining allowance. |
 | `remaining()` | Anyone | Reads the allowance available at the current block timestamp. |
 
-**Integration boundary.** WeiBudget accounts for authorized wei. It holds no funds and makes no transfers. A wallet integrating the contract can use its own executor address as the designated agent, call `consume` before transferring ETH, and revert the whole transaction if the transfer fails. Every spend path covered by the wallet's policy must use that check.
+**Wallet integration.** The example wallet holds the local test ETH. It deploys its own WeiBudget policy and sets the wallet's address as the authorized caller of `consume`. The owner sets or revokes the limit through the wallet. The appointed agent calls `pay`. The wallet checks the caller, charges the policy, then sends the value. A failed value transfer reverts the whole transaction, including the charge recorded in the separate policy contract.
 
-Each instance has one fixed owner and agent. A new calendar day starts at 00:00 UTC according to block time. Two spends on opposite sides of midnight can each use a full day's allowance. Reducing the limit below what was already used gives zero headroom. Transactions mined before revocation retain their effect.
+The wallet is a local reference implementation with one payment entry point and no owner recovery or withdrawal flow. Use disposable test funds. Each instance has one fixed owner and agent. A new calendar day starts at 00:00 UTC according to block time. Two spends on opposite sides of midnight can each use a full day's allowance. Reducing the limit below what was already used gives zero headroom. Transactions mined before revocation retain their effect.
 
 ## Build and test
 
@@ -49,9 +52,10 @@ fe --version
 fe fmt --check
 fe test
 fe build --contract WeiBudget --emit abi,bytecode
+fe build --contract ReferenceWallet --emit abi,bytecode
 ```
 
-[The Fe tests](src/tests.fe) cover distinct owner and agent callers, a disabled grant, an invalid agent address, exact and over-limit charges, same-day limit changes, revocation and regrant, UTC rollover, and arithmetic at the maximum allowance. The [demo runner](scripts/run-demo.py) exercises the public ABI on Anvil.
+[The Fe tests](src/tests.fe) cover distinct owner and agent callers, a disabled grant, an invalid agent address, exact and over-limit charges, same-day limit changes, revocation and regrant, UTC rollover, and arithmetic at the maximum allowance. The [wallet tests](src/wallet_tests.fe) check role separation, balance changes, transfer rollback, and a successful payment of the same size as a rejected one. The [demo runner](scripts/run-demo.py) exercises the public ABI on Anvil.
 
 ## Contest entry and disclosures
 
