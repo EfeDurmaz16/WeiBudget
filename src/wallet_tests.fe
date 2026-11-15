@@ -1,0 +1,86 @@
+use ingot::wallet::{ReferenceWallet, RejectingReceiver, WalletMsg}
+use std::evm::wei
+
+// Deploy through this fixture so the owner and the test's paying agent have
+// different EVM addresses. Each test runs on a fresh chain.
+msg WalletOwnerMsg {
+    #[selector = sol("open(address)")]
+    Open { agent: Address } -> Address,
+    #[selector = sol("revoke(address)")]
+    Revoke { wallet: Address },
+}
+
+contract WalletOwnerFixture uses (factory: mut Create, call: mut Call) {
+    recv WalletOwnerMsg {
+        Open { agent } -> Address uses (mut factory, mut call) {
+            let wallet = factory.create2<ReferenceWallet>(value: wei(0), args: (agent,), salt: 0)
+            wallet.call(WalletMsg::SetLimit { limit: wei(10) })
+            wallet
+        }
+        Revoke { wallet } uses (mut call) {
+            wallet.call(WalletMsg::Revoke {})
+        }
+    }
+}
+
+#[test(balance = 20)]
+fn wallet_payment_and_quota_roll_back_together()
+uses (evm: mut Evm, call: mut Call)
+{
+    let owner = evm.create2<WalletOwnerFixture>(value: wei(0), args: (), salt: 0)
+    let wallet: Address = owner.call(WalletOwnerMsg::Open { agent: evm.address() })
+    let rejecting = evm.create2<RejectingReceiver>(value: wei(0), args: (), salt: 0)
+    let recipient = Address::new(0xcafe)
+    evm.call(
+        addr: wallet,
+        gas: 100000,
+        value: wei(20),
+        message: WalletMsg::Deposit {},
+    )
+
+    assert!(
+        !wallet.try_call(WalletMsg::SetLimit { limit: wei(20) }).success(),
+    )
+    assert!(!wallet.try_call(WalletMsg::Revoke {}).success())
+    wallet.call(WalletMsg::Pay { to: recipient, amount: wei(6) })
+    assert!(evm.balance(recipient) == wei(6))
+    assert!(evm.balance(wallet) == wei(14))
+    assert!(wallet.call(WalletMsg::Remaining {}) == wei(4))
+
+    assert!(
+        !wallet.try_call(WalletMsg::Pay { to: rejecting, amount: wei(3) }).success(),
+    )
+    assert!(evm.balance(rejecting) == wei(0))
+    assert!(evm.balance(wallet) == wei(14))
+    assert!(wallet.call(WalletMsg::Remaining {}) == wei(4))
+
+    wallet.call(WalletMsg::Pay { to: recipient, amount: wei(3) })
+    assert!(evm.balance(recipient) == wei(9))
+    assert!(wallet.call(WalletMsg::Remaining {}) == wei(1))
+    owner.call(WalletOwnerMsg::Revoke { wallet })
+    assert!(
+        !wallet.try_call(WalletMsg::Pay { to: recipient, amount: wei(1) }).success(),
+    )
+    assert!(evm.balance(recipient) == wei(9))
+    assert!(evm.balance(wallet) == wei(11))
+    assert!(wallet.call(WalletMsg::Remaining {}) == wei(0))
+}
+
+#[test(balance = 10)]
+fn wallet_owner_cannot_pay_as_the_agent() uses (evm: mut Evm, call: mut Call) {
+    let wallet = evm.create2<ReferenceWallet>(value: wei(0), args: (Address::new(0xbeef),), salt: 0)
+    let recipient = Address::new(0xcafe)
+    evm.call(
+        addr: wallet,
+        gas: 100000,
+        value: wei(10),
+        message: WalletMsg::Deposit {},
+    )
+    wallet.call(WalletMsg::SetLimit { limit: wei(10) })
+    assert!(
+        !wallet.try_call(WalletMsg::Pay { to: recipient, amount: wei(3) }).success(),
+    )
+    assert!(evm.balance(recipient) == wei(0))
+    assert!(evm.balance(wallet) == wei(10))
+    assert!(wallet.call(WalletMsg::Remaining {}) == wei(10))
+}
