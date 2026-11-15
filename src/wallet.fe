@@ -1,0 +1,70 @@
+use ingot::{BudgetMsg, WeiBudget}
+
+pub msg WalletMsg {
+    #[selector = sol("deposit()")]
+    Deposit,
+    #[selector = sol("setLimit(uint256)")]
+    SetLimit { limit: Wei },
+    #[selector = sol("revoke()")]
+    Revoke,
+    #[selector = sol("remaining()")]
+    Remaining -> Wei,
+    #[selector = sol("pay(address,uint256)")]
+    Pay { to: Address, amount: Wei },
+}
+
+/// Local integration example. The wallet owns its policy and is its only consumer.
+pub contract ReferenceWallet uses (ctx: Ctx, factory: mut Create, call: mut Call) {
+    owner: Address,
+    agent: Address,
+    policy: Address,
+
+    init(delegate: Address)
+    uses (ctx, mut factory, mut owner, mut agent, mut policy)
+    {
+        assert!(delegate != Address::new(0), "Zero agent")
+        owner = ctx.caller()
+        agent = delegate
+        policy = factory.create2<WeiBudget>(value: Wei::zero(), args: (ctx.address(),), salt: 0)
+    }
+
+    recv WalletMsg {
+        #[payable]
+        Deposit {}
+
+        SetLimit { limit } uses (ctx, owner, policy, mut call) {
+            assert!(ctx.caller() == owner, "Owner required")
+            policy.call(BudgetMsg::SetLimit { limit })
+        }
+
+        Revoke uses (ctx, owner, policy, mut call) {
+            assert!(ctx.caller() == owner, "Owner required")
+            policy.call(BudgetMsg::Revoke {})
+        }
+
+        Remaining -> Wei uses (policy, call) {
+            policy.static(BudgetMsg::Remaining {})
+        }
+
+        Pay { to, amount } uses (ctx, agent, policy, mut call) {
+            assert!(ctx.caller() == agent, "Agent required")
+            assert!(to != Address::new(0), "Zero recipient")
+            let _: Wei = policy.call(BudgetMsg::Consume { amount })
+            // Reverting this transaction also rolls back the policy's charge.
+            assert!(
+                call.send_value(addr: to, gas: ctx.gas(), value: amount).success(),
+                "Payment failed",
+            )
+        }
+    }
+}
+
+/// Demo fixture that always declines a payment, even when the wallet has enough ETH.
+pub contract RejectingReceiver {
+    recv {
+        #[payable]
+        _ {
+            assert!(false, "Receiver declined")
+        }
+    }
+}
