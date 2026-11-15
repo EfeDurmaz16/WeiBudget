@@ -1,0 +1,172 @@
+use ingot::{BudgetMsg, WeiBudget, charge_at, remaining_at, utc_day}
+use std::evm::wei
+
+// A separate deployer makes the owner and agent genuinely different EVM callers.
+msg OwnerFixtureMsg {
+    #[selector = sol("deploy(address,uint256)")]
+    Deploy { agent: Address, limit: Wei } -> Address,
+}
+
+contract OwnerFixture uses (factory: mut Create, call: mut Call) {
+    recv OwnerFixtureMsg {
+        Deploy { agent, limit } -> Address uses (mut factory, mut call) {
+            let budget = factory.create2<WeiBudget>(value: wei(0), args: (agent,), salt: 0)
+            budget.call(BudgetMsg::SetLimit { limit })
+            budget
+        }
+    }
+}
+
+fn deploy(agent: Address) -> Address uses (evm: mut Evm) {
+    evm.create2<WeiBudget>(value: wei(0), args: (agent,), salt: 0)
+}
+
+#[test]
+fn allowance_starts_disabled() uses (evm: mut Evm, call: mut Call) {
+    let budget = deploy(agent: evm.address())
+    assert!(budget.call(BudgetMsg::Remaining {}) == wei(0))
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(1) }).success(),
+    )
+}
+
+#[test(should_revert)]
+fn zero_agent_is_rejected() uses (evm: mut Evm) {
+    let _ = deploy(agent: Address::new(0))
+}
+
+#[test]
+fn agent_can_consume_but_cannot_set_or_revoke()
+uses (evm: mut Evm, call: mut Call)
+{
+    let owner = evm.create2<OwnerFixture>(value: wei(0), args: (), salt: 0)
+    let budget: Address = owner
+        .call(
+            OwnerFixtureMsg::Deploy { agent: evm.address(), limit: wei(9) },
+        )
+    assert!(
+        !budget.try_call(BudgetMsg::SetLimit { limit: wei(99) }).success(),
+    )
+    assert!(!budget.try_call(BudgetMsg::Revoke {}).success())
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(1) }) == wei(8),
+    )
+}
+
+#[test]
+fn owner_cannot_consume_as_a_different_agent()
+uses (evm: mut Evm, call: mut Call)
+{
+    let budget = deploy(agent: Address::new(0x1234))
+    budget.call(BudgetMsg::SetLimit { limit: wei(10) })
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(1) }).success(),
+    )
+    assert!(budget.call(BudgetMsg::Remaining {}) == wei(10))
+}
+
+#[test]
+fn split_charges_reach_exact_cap_and_failed_charges_preserve_room()
+uses (evm: mut Evm, call: mut Call)
+{
+    let budget = deploy(agent: evm.address())
+    budget.call(BudgetMsg::SetLimit { limit: wei(10) })
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(6) }) == wei(4),
+    )
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(5) }).success(),
+    )
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(0) }).success(),
+    )
+    assert!(budget.call(BudgetMsg::Remaining {}) == wei(4))
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(4) }) == wei(0),
+    )
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(1) }).success(),
+    )
+}
+
+#[test]
+fn lowering_revoking_and_regranting_preserve_same_day_spend()
+uses (evm: mut Evm, call: mut Call)
+{
+    let budget = deploy(agent: evm.address())
+    budget.call(BudgetMsg::SetLimit { limit: wei(10) })
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(7) }) == wei(3),
+    )
+    budget.call(BudgetMsg::SetLimit { limit: wei(5) })
+    assert!(budget.call(BudgetMsg::Remaining {}) == wei(0))
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(1) }).success(),
+    )
+    budget.call(BudgetMsg::SetLimit { limit: wei(10) })
+    assert!(budget.call(BudgetMsg::Remaining {}) == wei(3))
+    budget.call(BudgetMsg::Revoke {})
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(1) }).success(),
+    )
+    budget.call(BudgetMsg::SetLimit { limit: wei(10) })
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(3) }) == wei(0),
+    )
+}
+
+#[test]
+fn maximum_uint256_cap_does_not_wrap() uses (evm: mut Evm, call: mut Call) {
+    let maximum = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    let budget = deploy(agent: evm.address())
+    budget.call(BudgetMsg::SetLimit { limit: wei(maximum) })
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(maximum - 1) }) == wei(1),
+    )
+    assert!(
+        !budget.try_call(BudgetMsg::Consume { amount: wei(2) }).success(),
+    )
+    assert!(
+        budget.call(BudgetMsg::Consume { amount: wei(1) }) == wei(0),
+    )
+}
+
+#[test]
+fn utc_midnight_opens_a_new_budget_and_keeps_revoked_grants_closed() {
+    let before = Timestamp::from_seconds(86_399)
+    let after = Timestamp::from_seconds(86_400)
+    assert!(utc_day(now: before) == 0)
+    assert!(utc_day(now: after) == 1)
+    assert!(
+        remaining_at(limit: wei(10), spent: wei(10), spent_day: 0, now: before) == wei(0),
+    )
+    assert!(
+        remaining_at(limit: wei(10), spent: wei(10), spent_day: 0, now: after) == wei(10),
+    )
+    assert!(
+        charge_at(
+                limit: wei(10),
+                spent: wei(10),
+                spent_day: 0,
+                now: after,
+                amount: wei(2),
+            )
+            == wei(2),
+    )
+    assert!(
+        remaining_at(limit: wei(0), spent: wei(10), spent_day: 0, now: after) == wei(0),
+    )
+}
+
+#[test]
+fn an_earlier_day_never_restores_room() {
+    let yesterday = Timestamp::from_seconds(86_399)
+    assert!(
+        remaining_at(
+                limit: wei(10),
+                spent: wei(4),
+                spent_day: 1,
+                now: yesterday,
+            ) == wei(0),
+    )
+}
